@@ -314,13 +314,17 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     // Compute and normalize redundancy score, and show feature ranking with and w/o the redundancy factor
     val rddFinalWeights = computeRedudancy(normWeights, marginalVector, total, nFeat, maxBatchSize, sparse).cache()
     
-    val (reliefRed, stdRelief) = selectFeatures(rddFinalWeights, nFeat)
+    val (reliefRed: Seq[F], stdRelief: Seq[F]) = selectFeatures(rddFinalWeights, nFeat)
     val outRC = reliefRed.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
     val outR = stdRelief.map { case F(feat, score) => (feat + 1) + "\t" + score.toString() }.mkString("\n")
-    println("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\tRelevance\tRedundancy\n" + outRC)
-    println("\n*** RELIEF selected features ***\nFeature\tScore\tRelevance\tRedundancy\n" + outR)
+    logDebug("\n*** RELIEF + Collisions selected features ***\nFeature\tScore\tRelevance\tRedundancy\n" + outRC)
+    logDebug("\n*** RELIEF selected features ***\nFeature\tScore\tRelevance\tRedundancy\n" + outR)
     
-    val model = new ReliefFRSelectorModel(uid, stdRelief.map(_.feat).toArray, reliefRed.map(_.feat).toArray)
+    val model = new ReliefFRSelectorModel(
+      uid,
+      stdRelief.map(v => (v.feat, v.crit.relevance.toDouble)).toArray,
+      reliefRed.map(v => (v.feat, v.crit.relevance.toDouble)).toArray)
+
     copyValues(model)
   }
   
@@ -680,7 +684,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
 
   // Case class for criteria/feature
   case class F(feat: Int, crit: FeatureScore)
-  
+
   /** Greedy process to select best N features according to relevance and redundancy scores **/
   private def selectFeatures(reliefRanking: RDD[(Int, (Float, Vector))], nFeat: Int): (Seq[F], Seq[F]) = {
     
@@ -781,8 +785,8 @@ object ReliefFRSelector extends DefaultParamsReadable[ReliefFRSelector] {
 @Experimental
 final class ReliefFRSelectorModel private[ml] (
     @Since("1.6.0") override val uid: String,
-    private val stdSelection: Array[Int],
-    private val redundancySelection: Array[Int]
+    private val stdSelection: Array[(Int, Double)],
+    private val redundancySelection: Array[(Int, Double)]
   ) extends Model[ReliefFRSelectorModel] with ReliefFRSelectorParams with MLWritable {
 
   import ReliefFRSelectorModel._
@@ -803,14 +807,14 @@ final class ReliefFRSelectorModel private[ml] (
   }
   
   def getReducedSubsetParam(): Int = selectionSize
-  def getSelectedFeatures(): Array[Int] = if($(redundancyRemoval)) redundancySelection else stdSelection
+  def getSelectedFeatures(): Array[(Int, Double)] = if($(redundancyRemoval)) redundancySelection else stdSelection
 
   override def transform(dataset: Dataset[_]): DataFrame = {
     val transformedSchema = transformSchema(dataset.schema, logging = true)
     val newField = transformedSchema.last
 
     // TODO: Make the transformer natively in ml framework to avoid extra conversion.
-    val selection: Array[Int] = getSelectedFeatures().slice(0, selectionSize).sorted
+    val selection: Array[Int] = getSelectedFeatures().map(_._1).slice(0, selectionSize).sorted
     // sfeat must be ordered asc
     val transformer: Vector => Vector = v =>  FeatureSelectionUtils.compress(OldVectors.fromML(v), selection).asML
     val selector = udf(transformer)
@@ -853,7 +857,7 @@ object ReliefFRSelectorModel extends MLReadable[ReliefFRSelectorModel] {
 
   private[ReliefFRSelectorModel] class ReliefFRSelectorModelWriter(instance: ReliefFRSelectorModel) extends MLWriter {
 
-    private case class Data(stdSelection: Seq[Int], redundancySelection: Seq[Int])
+    private case class Data(stdSelection: Seq[(Int, Double)], redundancySelection: Seq[(Int, Double)])
 
     // Save model to parquet file format (2 different sequences)
     override protected def saveImpl(path: String): Unit = {
@@ -872,8 +876,8 @@ object ReliefFRSelectorModel extends MLReadable[ReliefFRSelectorModel] {
       val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
       val dataPath = new Path(path, "data").toString
       val data = sparkSession.read.parquet(dataPath).select("stdSelection", "redundancySelection").head()
-      val reliefFeatures = data.getAs[Seq[Int]](0).toArray
-      val reliefColFeatures = data.getAs[Seq[Int]](1).toArray
+      val reliefFeatures = data.getAs[Seq[(Int, Double)]](0).toArray
+      val reliefColFeatures = data.getAs[Seq[(Int, Double)]](1).toArray
       val model = new ReliefFRSelectorModel(metadata.uid, reliefFeatures, reliefColFeatures)
       DefaultParamsReader.getAndSetParams(model, metadata)
       model

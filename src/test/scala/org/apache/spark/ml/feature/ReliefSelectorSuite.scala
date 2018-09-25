@@ -34,7 +34,7 @@ class ReliefSelectorSuite extends FunSuite with BeforeAndAfterAll {
         10, discreteData, allVectorsDense, pad)
 
     assertResult("29, 223, 10, 19, 172, 55, 183, 23, 35, 56") {
-      model.getSelectedFeatures.mkString(", ")
+      model.getSelectedFeatures.map(_._1)mkString(", ")
     }
   }
   
@@ -50,7 +50,7 @@ class ReliefSelectorSuite extends FunSuite with BeforeAndAfterAll {
         10, discreteData, allVectorsDense, pad)
 
     assertResult("1422, 248, 74, 244, 266, 764, 1413, 1771, 1152, 779") {
-      model.getSelectedFeatures.mkString(", ")
+      model.getSelectedFeatures.map(_._1).mkString(", ")
     }
   }
 }
