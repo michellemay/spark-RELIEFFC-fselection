@@ -322,8 +322,8 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
     
     val model = new ReliefFRSelectorModel(
       uid,
-      stdRelief.map(v => (v.feat, v.crit.relevance.toDouble)).toArray,
-      reliefRed.map(v => (v.feat, v.crit.relevance.toDouble)).toArray)
+      stdRelief.map(v => (v.feat, v.crit.score.toDouble)).toArray,
+      reliefRed.map(v => (v.feat, v.crit.score.toDouble)).toArray)
 
     copyValues(model)
   }
