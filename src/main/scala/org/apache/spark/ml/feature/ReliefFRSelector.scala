@@ -807,14 +807,15 @@ final class ReliefFRSelectorModel private[ml] (
   }
   
   def getReducedSubsetParam(): Int = selectionSize
-  def getSelectedFeatures(): Array[(Int, Double)] = if($(redundancyRemoval)) redundancySelection else stdSelection
+  def getSelectedFeaturesWithScore(): Array[(Int, Double)] = if($(redundancyRemoval)) redundancySelection else stdSelection
+  def getSelectedFeatures(): Array[Int] = getSelectedFeaturesWithScore.map(_._1)
 
   override def transform(dataset: Dataset[_]): DataFrame = {
     val transformedSchema = transformSchema(dataset.schema, logging = true)
     val newField = transformedSchema.last
 
     // TODO: Make the transformer natively in ml framework to avoid extra conversion.
-    val selection: Array[Int] = getSelectedFeatures().map(_._1).slice(0, selectionSize).sorted
+    val selection: Array[Int] = getSelectedFeatures().slice(0, selectionSize).sorted
     // sfeat must be ordered asc
     val transformer: Vector => Vector = v =>  FeatureSelectionUtils.compress(OldVectors.fromML(v), selection).asML
     val selector = udf(transformer)
