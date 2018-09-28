@@ -333,42 +333,77 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       val maxRelief = partialWeights.values.max()
       val minRelief = partialWeights.values.min()
       partialWeights.mapValues{ x => (x - minRelief) / (maxRelief - minRelief)}
-  }  
-  
+  }
+
+  // Select nearest neighbors from all partitions. For each query element, create a map (partitionID, list of local indices)
+  // Output: QueryIdx -> Map(PartitionIdx -> Iterator(ItemIdxInPartition))
   private def approxNNByPartition(
       modelDataset: Dataset[_],
       bModelQuery: Broadcast[Array[Row]],
       k: Int): RDD[(Long, Map[Int, Iterable[Int]])] = {
-    
+
     case class Localization(part: Int, index: Int)
-    val sc = modelDataset.sparkSession.sparkContext
+    val ordering = Ordering[Float].on[(Float, Localization)](_._1).reverse// BPQ needs reverse ordering
+
     val icol = $(inputCol) // Use local variables to avoid shuffle the entire object to each map.
     val input: RDD[Row] = modelDataset.select(icol).rdd
-    
-    val neighbors: RDD[(Long, Map[Int, Iterable[Int]])] = input.mapPartitionsWithIndex { 
-      case (pindex, it) => 
+
+    //TODO we should support mixed categorical and continuous variables.
+    val isCont = !$(discreteData)
+    val distanceFct = if (isCont) {
+      (x: Vector, y: Vector) => { Math.sqrt(Vectors.sqdist(x, y)).toFloat }
+    } else {
+      // Categorical variables.
+      //
+      // TODO: sparse and dense optimal implemetations.
+      (x: Vector, y: Vector) => {
+        val dx = x.toDense.values
+        val dy = y.toDense.values
+        val dist = Math.sqrt(dx.zip(dy).count { case (xi, yi) => xi != yi })
+        dist.toFloat
+      }
+    }
+
+    val neighborsPerQuery: RDD[(Long, BPQ[(Float, Localization)])] = input.mapPartitionsWithIndex {
+      case (pindex: Int, it: Iterator[Row]) =>
           // Initialize the map composed by the priority queue and the central element's ID
-          val query = bModelQuery.value // Query set. Fields: "UniqueID", $(inputCol), $(labelCol)
-          val ordering = Ordering[Float].on[(Float, Localization)](_._1).reverse// BPQ needs reverse ordering 
-          // BPQ to sort from closer neighbors to farther (to be fullfilled below)
-          val neighbors = query.map { r => r.getAs[Long]("UniqueID") -> 
-              new BPQ[(Float, Localization)](k)(ordering) 
-            }   
+          val query: Array[Row] = bModelQuery.value // Query set. Fields: "UniqueID", $(inputCol), $(labelCol)
+
+          // Neighbors: QueryIdx -> BPQ[distance -> (Partition, ItemIdx)]
+          val neighbors: Array[(Long, BPQ[(Float, Localization)])] = query.map { r =>
+            // BPQ to sort from closer neighbors to farther (to be fullfilled below)
+            r.getAs[Long]("UniqueID") -> new BPQ[(Float, Localization)](k)(ordering)
+          }
       
           var i = 0 // index for local elements in this partition.
           while(it.hasNext) { // local elements
+            // Current vector
             val inputNeig = it.next.getAs[Vector](icol)
-              (0 until query.size).foreach { j => // query elements broadcasted
-                 val distance = Math.sqrt(Vectors.sqdist(query(j).getAs[Vector](icol), inputNeig)).toFloat
-                 neighbors(j)._2 += distance -> Localization(pindex.toShort, i)    
-               }
+
+            // Compare to all query vectors (query elements broadcasted)
+            query.indices.foreach { queryIdx =>
+              val distance = distanceFct(query(queryIdx).getAs[Vector](icol), inputNeig)
+
+              // accumulate neighbors by query items
+              neighbors(queryIdx)._2 += distance -> Localization(pindex.toShort, i)
+             }
             i += 1              
           }            
           neighbors.toIterator
-      }.reduceByKey(_ ++= _).mapValues(
-          _.map(l => Localization.unapply(l._2).get).groupBy(_._1).mapValues(_.map(_._2)).map(identity)) 
-      // Select nearest neighbors from all partitions. For each query element, create a map (partitionID, list of local indices)   
-      // map(identity) needed to fix bug: https://issues.scala-lang.org/browse/SI-7005
+      }
+
+    val neighbors: RDD[(Long, Map[Int, Iterable[Int]])] = neighborsPerQuery
+      .reduceByKey(_ ++= _) // get nearest elements regardless of partitions
+      .mapValues { nearestElementsForQuery: BPQ[(Float, Localization)] =>
+        // Map(PartitionIdx -> Iterator(ItemIdxInPartition))
+        val ret: Map[Int, Iterable[Int]] = nearestElementsForQuery
+          .map(_._2) // Drop distance
+          .groupBy { (e: Localization) => e.part }
+          .mapValues{ v: Iterable[Localization] => v.map(_.index) }
+          .map(identity) // map(identity) needed to fix bug: https://issues.scala-lang.org/browse/SI-7005
+        ret
+      }
+
     neighbors
   }
   
@@ -422,6 +457,13 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
         val pcounter = Array.fill(nFeat)(0.0d) // Store individual votes for each feature
         val jointVote = if(isCont) (i1: Int, i2: Int) => (pcounter(i1) + pcounter(i2)) / 2 else // Joint votes
                       (i1: Int, _: Int) => pcounter(i1)
+
+        // TODO should have a featurewise distance function
+        val distanceFct = if (isCont) {
+          (a: Double, b: Double) => math.abs(a - b)
+        } else {
+          (a: Double, b: Double) => if (a == b) 0.0 else 1.0
+        }
                       
         // Compute redundancy and relevancy contributions among the query set and the neighborhood set
         bModelQuery.value.map{ row =>
@@ -440,7 +482,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                       classCounter(label2Num(nlabel) + modIdx) += 1
                             
                       qinput.foreachActive{ (index, value) =>
-                         val fdistance = math.abs(value - ninput(index))
+                         val fdistance = distanceFct(value, ninput(index))
                          //// Annotate RELIEF computations
                          reliefWeights(index)._1(label2Num(nlabel) + modIdx) += fdistance.toFloat
                          ////// mCR functionality (collision detection)
@@ -508,7 +550,7 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
       // Use local vars to avoid sending the entire object to mappers
       val isCont = !$(discreteData); val lowerDistanceTh = $(lowerDistanceThreshold); val icol = $(inputCol); val lcol = $(labelCol)
       val lseed = $(seed)
-      
+
       // Left side: relevance, right side: redundancy joint
       val rawReliefWeights: RDD[(Int, (BDV[Float], Vector))] = 
         modelDataset.rdd.mapPartitionsWithIndex { case(pindex, it) =>
@@ -544,13 +586,19 @@ final class ReliefFRSelector @Since("1.6.0") (@Since("1.6.0") override val uid: 
                         val v2Indices = ninput.indices; val nnzv2 = v2Indices.length; var kv2 = 0
                         
                         while (kv1 < nnzv1 || kv2 < nnzv2) {
-                          var score = 0.0; var index = kv1                
+                          var score = 0.0; var index = kv1
                           if (kv2 >= nnzv2 || (kv1 < nnzv1 && v1Indices(kv1) < v2Indices(kv2))) {
-                            score = qinput.values(kv1); kv1 += 1; index = kv1
+                            score = if (isCont) qinput.values(kv1) else 1.0
+                            kv1 += 1; index = kv1
                           } else if (kv1 >= nnzv1 || (kv2 < nnzv2 && v2Indices(kv2) < v1Indices(kv1))) {
-                            score = ninput.values(kv2); kv2 += 1; index = kv2
+                            score = if (isCont) ninput.values(kv2) else 1.0
+                            kv2 += 1; index = kv2
                           } else {
-                            score = qinput.values(kv1) - ninput.values(kv2); kv1 += 1; kv2 += 1; index = kv1
+                            score = qinput.values(kv1) - ninput.values(kv2)
+                            if (!isCont && score != 0.0) {
+                              score = 1.0
+                            }
+                            kv1 += 1; kv2 += 1; index = kv1
                           }
                           
                           val fdistance = math.abs(score)
